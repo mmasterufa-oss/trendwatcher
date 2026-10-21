@@ -18,7 +18,11 @@ fi
 
 echo "== 1/4 Docker =="
 if ! command -v docker >/dev/null; then
-  curl -fsSL https://get.docker.com | sh
+  curl -fsSL https://get.docker.com | sh || true
+fi
+if ! command -v docker >/dev/null; then
+  # запасной путь: Docker из репозитория Ubuntu
+  apt-get update -qq && apt-get install -y -qq docker.io && systemctl enable --now docker
 fi
 command -v git >/dev/null || (apt-get update -qq && apt-get install -y -qq git)
 
