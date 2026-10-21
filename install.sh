@@ -36,7 +36,18 @@ fi
 mkdir -p "$DIR/data"
 
 echo "== 3/4 Настройки =="
-if [ ! -f "$ENV_FILE" ]; then
+if [ ! -f "$ENV_FILE" ] && [ -n "${TELEGRAM_BOT_TOKEN:-}" ]; then
+  # неинтерактивный режим: значения переданы через переменные окружения (например, из cloud-init)
+  umask 077
+  cat > "$ENV_FILE" <<EOF
+TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
+TRENDSEE_LOGIN=${TRENDSEE_LOGIN:-}
+TRENDSEE_PASSWORD=${TRENDSEE_PASSWORD:-}
+CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN:-}
+TZ=Europe/Moscow
+EOF
+  chmod 600 "$ENV_FILE"
+elif [ ! -f "$ENV_FILE" ]; then
   ask() { local v; read -r -p "$1: " v </dev/tty; echo "$v"; }
   asks() { local v; read -r -s -p "$1: " v </dev/tty; echo >&2; echo "$v"; }
   TG=$(asks "Токен Telegram-бота (ввод скрыт)")
