@@ -77,10 +77,12 @@ def render_parts(items: list[dict], header: str, show_niche: bool = True) -> lis
     return lines
 
 
-def keyboard(batch_id: str, n: int, more: bool = True) -> InlineKeyboardMarkup:
+def keyboard(batch_id: str, n: int, more: bool = True) -> InlineKeyboardMarkup | None:
     rows = []
     if more:
         rows.append([InlineKeyboardButton("🔁 Ещё 5", callback_data=f"m:{batch_id}")])
+    if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return InlineKeyboardMarkup(rows) if rows else None
     rows.append([InlineKeyboardButton("✍ Сценарий по №…", callback_data="noop")])
     nums = [InlineKeyboardButton(f"№{i}", callback_data=f"s:{batch_id}:{i - 1}") for i in range(1, n + 1)]
     rows.extend(nums[i:i + 5] for i in range(0, len(nums), 5))
@@ -424,6 +426,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     elif parts[0] == "s":
         n = int(parts[2])
         item = batch["items"][n]
+        if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            await q.answer("Сценарии появятся после подключения токена Claude", show_alert=True)
+            return
         await q.answer("Пишу сценарий…")
 
         async def job():
@@ -433,6 +438,21 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception as ex:
                 await ctx.bot.send_message(chat_id, f"Не получилось написать сценарий: {e(str(ex)[:200])}")
         asyncio.create_task(job())
+
+
+async def cmd_debug(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Владельцу: файлы для разбора (пример ответа Trendsee, страница входа)."""
+    if not is_owner(update):
+        return
+    sent = 0
+    for name in ("sample_response.json", "login_fail.txt", "login_fail.png", "login_noform.txt"):
+        f = storage.DATA_DIR / name
+        if f.exists():
+            with f.open("rb") as fh:
+                await ctx.bot.send_document(update.effective_chat.id, fh, filename=name)
+            sent += 1
+    if not sent:
+        await update.message.reply_text("Файлов для разбора пока нет.")
 
 
 # ---------------- кнопки меню ----------------
@@ -491,6 +511,7 @@ def main() -> None:
     app.add_handler(CommandHandler("time", cmd_time))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("menu", cmd_menu))
+    app.add_handler(CommandHandler("debug", cmd_debug))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Трендвотчер запущен")

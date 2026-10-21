@@ -292,32 +292,62 @@ def _date(flat):
     return None
 
 
+POST_MARKERS = ("/reel/", "/reels/", "/p/", "/tv/", "/video/", "/shorts/", "watch?v=", "youtu.be/", "/clip")
+
+
 def _link(flat):
-    for k in ("url", "link", "post_url", "permalink", "source_url", "original_url", "video_url"):
-        for fk, v in flat.items():
-            if fk.split(".")[-1] == k and isinstance(v, str) and LINK_RE.match(v):
-                return v
-    for v in flat.values():
+    """Ссылка именно на ролик, а не на профиль автора."""
+    urls = []
+    for k, v in flat.items():
         if isinstance(v, str):
-            m = LINK_RE.search(v)
-            if m:
-                return m.group(0)
-    code = _str(flat, "shortcode", "code")
-    if code and re.fullmatch(r"[\w-]{6,20}", code):
-        return f"https://www.instagram.com/reel/{code}/"
+            for m in LINK_RE.finditer(v):
+                urls.append((k, m.group(0)))
+    for _, u in urls:
+        if any(mk in u for mk in POST_MARKERS):
+            return u
+    # короткий код поста → ссылка на рилс
+    for k, v in flat.items():
+        last = k.split(".")[-1]
+        if last in ("shortcode", "short_code", "code", "post_code", "shortcode_id") and isinstance(v, str) \
+                and re.fullmatch(r"[\w-]{6,20}", v):
+            return f"https://www.instagram.com/reel/{v}/"
+    for k, v in flat.items():
+        last = k.split(".")[-1]
+        if last in ("video_id", "aweme_id") and v and "tiktok" in " ".join(u for _, u in urls):
+            author = next((u for _, u in urls if "tiktok" in u), "").rstrip("/")
+            return f"{author}/video/{v}"
+    return urls[0][1] if urls else ""
+
+
+def _post_id(flat) -> str:
+    for k, v in flat.items():
+        last = k.split(".")[-1]
+        if last in ("id", "post_id", "pk", "media_id", "external_id", "uuid") and v not in (None, ""):
+            return str(v)
     return ""
+
+
+_keys_logged = False
 
 
 def parse_posts(body) -> list[dict]:
     lst = _find_list(body) or []
     out = []
+    global _keys_logged
     for raw in lst:
         flat = _flatten(raw)
+        if not _keys_logged:
+            _keys_logged = True
+            log.info("Поля ролика в ответе Trendsee: %s", ", ".join(list(flat)[:60]))
         link = _link(flat)
         if not link:
             continue
+        link = link if "watch?v=" in link else link.split("?")[0]
+        pid = _post_id(flat)
+        if not any(mk in link for mk in POST_MARKERS) and pid:
+            link = f"{link.rstrip('/')}#post-{pid}"  # профиль: делаем ссылку уникальной для каждого ролика
         out.append({
-            "link": link.split("?")[0],
+            "link": link,
             "author": _str(flat, "username", "author", "owner", "nickname", "login"),
             "views": _num(flat, "view", "play"),
             "likes": _num(flat, "like", exclude=("dislike",)),
