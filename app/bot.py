@@ -212,7 +212,7 @@ async def search_query(query: str) -> list[dict]:
     async with search_lock:
         storage.update_state(last_run=datetime.now(TZ).isoformat(timespec="minutes"))
         log.info("Поиск по запросу пользователя: %s", query)
-        posts = await asyncio.wait_for(trendsee.search([query]), timeout=300)
+        posts = await asyncio.wait_for(trendsee.search([query]), timeout=480)
     storage.update_state(last_ok=datetime.now(TZ).isoformat(timespec="minutes"), last_error=None)
     return posts
 

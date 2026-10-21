@@ -61,13 +61,20 @@ async def _login(page) -> None:
         await btn.first.click()
     else:
         await pwd.press("Enter")
-    try:
-        await page.wait_for_url(lambda u: "/auth/" not in u, timeout=30000)
-        log.info("Вход в Trendsee: успешно")
-        await page.wait_for_timeout(3000)
-        return
-    except Exception:
-        pass
+    # Trendsee входит медленно (30-40 секунд и дольше), ждём до 2 минут
+    for sec in range(120):
+        await page.wait_for_timeout(1000)
+        if "/auth/" not in page.url:
+            log.info("Вход в Trendsee: успешно за %d с", sec + 1)
+            await page.wait_for_timeout(3000)
+            return
+        if sec == 60:
+            # не дождались — нажимаем «Дальше» ещё раз
+            try:
+                if await btn.count() and await btn.first.is_enabled():
+                    await btn.first.click()
+            except Exception:
+                pass
     hint = await _dump(page, "login_fail")
     raise TrendseeAuthError(f"сайт не пустил после ввода почты и пароля{': ' + hint if hint else ''}")
 
@@ -101,7 +108,7 @@ async def _dump(page, name: str) -> str:
     return hint
 
 
-async def _capture_auth(page, timeout_s: int = 25) -> dict | None:
+async def _capture_auth(page, timeout_s: int = 45) -> dict | None:
     captured: dict = {}
 
     def on_request(req):
