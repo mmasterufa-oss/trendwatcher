@@ -42,3 +42,14 @@ python -m app.bot
 - `app/bot.py` — Telegram, расписание, команды.
 - `keywords.default.json` — стартовые ключевые слова (дальше меняются командой `/keywords`).
 - `STYLE.md` — голос бренда для идей и сценариев.
+
+## Свой VPS (Timeweb и т.п.)
+
+Сервер вне России (Нидерланды/Германия), Ubuntu 24.04, от 2 ГБ памяти. В консоли сервера:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mmasterufa-oss/trendwatcher/main/install.sh | sudo bash
+```
+
+Скрипт поставит Docker, спросит токены и запустит агента. Данные лежат в `/opt/trendwatcher/data`, настройки в `/opt/trendwatcher/.env`.
+Обновить агента: запустить ту же команду ещё раз.
