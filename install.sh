@@ -7,6 +7,15 @@ REPO="https://github.com/mmasterufa-oss/trendwatcher.git"
 DIR=/opt/trendwatcher
 ENV_FILE=$DIR/.env
 
+echo "== 0/4 Память =="
+# Если памяти меньше 2 ГБ и нет swap — добавляем swap-файл на 2 ГБ (браузеру нужна память)
+if [ "$(awk '/MemTotal/{print $2}' /proc/meminfo)" -lt 2000000 ] && [ "$(awk '/SwapTotal/{print $2}' /proc/meminfo)" -lt 1000000 ]; then
+  fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+  chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+  grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo "Добавлен swap 2 ГБ"
+fi
+
 echo "== 1/4 Docker =="
 if ! command -v docker >/dev/null; then
   curl -fsSL https://get.docker.com | sh
