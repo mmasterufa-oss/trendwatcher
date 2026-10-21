@@ -8,11 +8,11 @@ import secrets
 from datetime import datetime, timedelta, timezone, time as dtime
 from zoneinfo import ZoneInfo
 
-from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions,
-                      Update)
+from telegram import (ForceReply, InlineKeyboardButton, InlineKeyboardMarkup,
+                      LinkPreviewOptions, ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
-                          ContextTypes, Defaults)
+                          ContextTypes, Defaults, MessageHandler, filters)
 
 from . import ai, storage, trendsee
 
@@ -24,6 +24,17 @@ TZ = ZoneInfo(os.environ.get("TZ", "Europe/Moscow"))
 search_lock = asyncio.Lock()
 GROUPS = {"основные": "main", "соседние": "near", "английские": "en",
           "main": "main", "near": "near", "en": "en"}
+
+# кнопки меню под полем ввода
+BTN_KEYWORDS = "🔎 Поиск трендов по запросам"
+BTN_QUERY_NOW = "⚡ Найти тренды по запросу сейчас"
+BTN_QUERY_WEEK = "📅 Найти все тренды недели по запросу"
+WEEK_LIMIT = 15
+
+
+def menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[BTN_KEYWORDS], [BTN_QUERY_NOW], [BTN_QUERY_WEEK]],
+                               resize_keyboard=True, is_persistent=True)
 
 
 # ---------------- форматирование ----------------
@@ -44,7 +55,12 @@ def e(s) -> str:
 
 
 def render(items: list[dict], header: str) -> str:
-    niche = storage.get_keywords().get("niche", "")
+    return "\n".join(render_parts(items, header))
+
+
+def render_parts(items: list[dict], header: str, show_niche: bool = True) -> list[str]:
+    """Заголовок + по блоку на каждый ролик (для разбивки длинных сообщений)."""
+    niche = storage.get_keywords().get("niche", "") if show_niche else ""
     lines = [f"<b>🔥 Тренды · {e(header)}</b>" + (f" · ниша: {e(niche.split(':')[0])}" if niche else "")]
     for i, it in enumerate(items, 1):
         title = it.get("title") or (it.get("caption") or "").split("\n")[0][:70] or it.get("author") or "Ролик"
@@ -58,15 +74,30 @@ def render(items: list[dict], header: str) -> str:
             block.append(f"Идея для нас: {e(it['idea'])}")
         block.append(e(it["link"]))
         lines.append("\n".join(block))
-    return "\n".join(lines)
+    return lines
 
 
-def keyboard(batch_id: str, n: int) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("🔁 Ещё 5", callback_data=f"m:{batch_id}")]]
+def keyboard(batch_id: str, n: int, more: bool = True) -> InlineKeyboardMarkup:
+    rows = []
+    if more:
+        rows.append([InlineKeyboardButton("🔁 Ещё 5", callback_data=f"m:{batch_id}")])
     rows.append([InlineKeyboardButton("✍ Сценарий по №…", callback_data="noop")])
-    rows.append([InlineKeyboardButton(f"№{i}", callback_data=f"s:{batch_id}:{i - 1}")
-                 for i in range(1, n + 1)])
+    nums = [InlineKeyboardButton(f"№{i}", callback_data=f"s:{batch_id}:{i - 1}") for i in range(1, n + 1)]
+    rows.extend(nums[i:i + 5] for i in range(0, len(nums), 5))
     return InlineKeyboardMarkup(rows)
+
+
+def split_messages(parts: list[str], limit: int = 3900) -> list[str]:
+    msgs, cur = [], ""
+    for p in parts:
+        if cur and len(cur) + len(p) + 1 > limit:
+            msgs.append(cur)
+            cur = p.lstrip("\n")
+        else:
+            cur = f"{cur}\n{p}" if cur else p
+    if cur:
+        msgs.append(cur)
+    return msgs
 
 
 def header_now() -> str:
@@ -83,9 +114,10 @@ def pick_phrases(kw: dict) -> list[str]:
     return take("main", 3) + take("near", 2) + take("en", 1)
 
 
-def filter_candidates(posts: list[dict]) -> list[dict]:
-    seen = storage.get_seen()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+def filter_candidates(posts: list[dict], days: int = 30, skip_seen: bool = True,
+                      limit: int = 15) -> list[dict]:
+    seen = storage.get_seen() if skip_seen else set()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     uniq: dict[str, dict] = {}
     for p in posts:
         link = p["link"]
@@ -105,7 +137,7 @@ def filter_candidates(posts: list[dict]) -> list[dict]:
         match = all(w in cap for w in q) if q else False
         return (match, p.get("viral") or 0, p.get("views") or 0)
 
-    return sorted(uniq.values(), key=score, reverse=True)[:15]
+    return sorted(uniq.values(), key=score, reverse=True)[:limit]
 
 
 async def make_batch(pool: list[dict] | None = None) -> tuple[str, list[dict]]:
@@ -176,6 +208,65 @@ async def send_trends(app: Application, chat_ids: list[int], pool=None, header=N
             log.warning("Не отправил в %s: %s", cid, ex)
 
 
+async def search_query(query: str) -> list[dict]:
+    async with search_lock:
+        storage.update_state(last_run=datetime.now(TZ).isoformat(timespec="minutes"))
+        log.info("Поиск по запросу пользователя: %s", query)
+        posts = await asyncio.wait_for(trendsee.search([query]), timeout=300)
+    storage.update_state(last_ok=datetime.now(TZ).isoformat(timespec="minutes"), last_error=None)
+    return posts
+
+
+async def query_trends(app: Application, chat_id: int, query: str, mode: str) -> None:
+    """mode='now' — 5 лучших с разбором; mode='week' — все тренды за 7 дней."""
+    try:
+        posts = await search_query(query)
+    except trendsee.TrendseeAuthError as ex:
+        storage.update_state(last_error=f"доступ к Trendsee: {ex}")
+        await app.bot.send_message(chat_id, "⚠️ Не получилось войти в Trendsee. Проверьте логин, пароль и тариф.")
+        return
+    except Exception as ex:
+        log.exception("Ошибка поиска по запросу")
+        storage.update_state(last_error=str(ex)[:300])
+        await app.bot.send_message(chat_id, f"⚠️ Поиск не удался: {e(str(ex)[:200])}")
+        return
+
+    if mode == "week":
+        items = filter_candidates(posts, days=7, skip_seen=False, limit=WEEK_LIMIT)
+        if not any(p.get("date") for p in posts):
+            note = "\n<i>Даты публикаций Trendsee не отдал, показываю самые вирусные без отсева по дате.</i>"
+        else:
+            items = [p for p in items if p.get("date")]
+            note = ""
+        if not items:
+            await app.bot.send_message(chat_id, f"За последние 7 дней по запросу «{e(query)}» трендов не нашлось.",
+                                       reply_markup=menu_kb())
+            return
+        batch_id = secrets.token_hex(4)
+        storage.save_batch(batch_id, {"items": items, "pool": [], "query": query})
+        msgs = split_messages(render_parts(items, f"все тренды недели · «{query}»", show_niche=False))
+        for i, text in enumerate(msgs):
+            last = i == len(msgs) - 1
+            await app.bot.send_message(chat_id, text + (note if last else ""),
+                                       reply_markup=keyboard(batch_id, len(items), more=False) if last else None)
+        return
+
+    pool = filter_candidates(posts, days=30, skip_seen=False, limit=15)
+    if not pool:
+        await app.bot.send_message(chat_id, f"По запросу «{e(query)}» свежих трендов не нашлось. "
+                                            "Попробуйте сформулировать иначе.", reply_markup=menu_kb())
+        return
+    async with search_lock:
+        items = await ai.pick_five(pool, storage.get_keywords().get("niche", ""))
+    shown = {i["link"] for i in items}
+    rest = [c for c in pool if c["link"] not in shown]
+    batch_id = secrets.token_hex(4)
+    storage.save_batch(batch_id, {"items": items, "pool": rest, "query": query})
+    storage.add_seen(list(shown))
+    await app.bot.send_message(chat_id, render(items, f"по запросу «{query}»"),
+                               reply_markup=keyboard(batch_id, len(items), more=bool(rest)))
+
+
 async def scheduled(ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chats = storage.get_state()["chats"]
     if chats:
@@ -192,7 +283,8 @@ def schedule_jobs(app: Application) -> None:
 
 
 # ---------------- команды ----------------
-HELP = ("Команды:\n/now — тренды сейчас\n/keywords — ключевые слова\n"
+HELP = ("Кнопки внизу: поиск по ключевым словам, по своему запросу и тренды недели.\n\n"
+        "Команды:\n/menu — показать кнопки\n/now — тренды сейчас\n/keywords — ключевые слова\n"
         "/time 09:00 19:00 — время рассылки\n/status — состояние\n/addchat — добавить этот чат (владелец)")
 
 
@@ -201,14 +293,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if st["owner"] is None:
         storage.update_state(owner=update.effective_user.id, chats=[chat_id])
-        await update.message.reply_text("Готово, вы владелец бота, этот чат подключён к рассылке.\n\n" + HELP)
+        await update.message.reply_text("Готово, вы владелец бота, этот чат подключён к рассылке.\n\n" + HELP, reply_markup=menu_kb())
         return
     if is_owner(update) and chat_id not in st["chats"]:
         storage.update_state(chats=st["chats"] + [chat_id])
-        await update.message.reply_text("Этот чат подключён к рассылке трендов.\n\n" + HELP)
+        await update.message.reply_text("Этот чат подключён к рассылке трендов.\n\n" + HELP, reply_markup=menu_kb())
         return
     if is_allowed(update):
-        await update.message.reply_text("Я на месте. " + HELP)
+        await update.message.reply_text("Я на месте. " + HELP, reply_markup=menu_kb())
     else:
         await update.message.reply_text("Доступ закрыт. Попросите владельца бота добавить этот чат.")
 
@@ -307,7 +399,25 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await q.answer("Подборка устарела, нажмите /now")
         return
     chat_id = update.effective_chat.id
-    if parts[0] == "m":
+    if parts[0] == "m" and batch.get("query"):
+        pool = batch.get("pool") or []
+        if not pool:
+            await q.answer("Больше трендов по этому запросу нет")
+            return
+        await q.answer("Отбираю ещё 5…")
+
+        async def more():
+            async with search_lock:
+                items = await ai.pick_five(pool, storage.get_keywords().get("niche", ""))
+            shown = {i["link"] for i in items}
+            rest = [c for c in pool if c["link"] not in shown]
+            bid = secrets.token_hex(4)
+            storage.save_batch(bid, {"items": items, "pool": rest, "query": batch["query"]})
+            storage.add_seen(list(shown))
+            await ctx.bot.send_message(chat_id, render(items, f"по запросу «{batch['query']}» · ещё"),
+                                       reply_markup=keyboard(bid, len(items), more=bool(rest)))
+        asyncio.create_task(more())
+    elif parts[0] == "m":
         await q.answer("Ищу ещё 5…")
         asyncio.create_task(send_trends(ctx.application, [chat_id], pool=batch["pool"],
                                         header=header_now() + " · ещё"))
@@ -325,10 +435,42 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         asyncio.create_task(job())
 
 
+# ---------------- кнопки меню ----------------
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_allowed(update):
+        await update.message.reply_text("Выберите, что найти 👇", reply_markup=menu_kb())
+
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not is_allowed(update):
+        return
+    text = (update.message.text or "").strip()
+    if text == BTN_KEYWORDS:
+        ctx.chat_data.pop("await", None)
+        await cmd_now(update, ctx)
+        return
+    if text in (BTN_QUERY_NOW, BTN_QUERY_WEEK):
+        ctx.chat_data["await"] = "now" if text == BTN_QUERY_NOW else "week"
+        what = "5 лучших трендов" if text == BTN_QUERY_NOW else "все тренды за последние 7 дней"
+        await update.message.reply_text(
+            f"Напишите запрос — пришлю {what}.\nНапример: <i>шкаф купе</i>, <i>кухня в хрущёвке</i>, <i>home decor</i>",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="ваш запрос"))
+        return
+    mode = ctx.chat_data.pop("await", None)
+    if not mode:
+        return
+    query = text[:80]
+    note = "Ищу 5 лучших" if mode == "now" else "Собираю все тренды недели"
+    busy = " (дождусь окончания текущего поиска)" if search_lock.locked() else ""
+    await update.message.reply_text(f"{note} по запросу «{e(query)}», это 1-2 минуты…{busy}",
+                                    reply_markup=menu_kb())
+    asyncio.create_task(query_trends(ctx.application, update.effective_chat.id, query, mode))
+
+
 async def post_init(app: Application) -> None:
     schedule_jobs(app)
     await app.bot.set_my_commands([
-        ("now", "Тренды сейчас"), ("keywords", "Ключевые слова"),
+        ("menu", "Кнопки поиска"), ("now", "Тренды сейчас"), ("keywords", "Ключевые слова"),
         ("time", "Время рассылки"), ("status", "Состояние"), ("addchat", "Добавить чат"),
     ])
 
@@ -348,7 +490,9 @@ def main() -> None:
     app.add_handler(CommandHandler("keywords", cmd_keywords))
     app.add_handler(CommandHandler("time", cmd_time))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("menu", cmd_menu))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     log.info("Трендвотчер запущен")
     app.run_polling(drop_pending_updates=True)
 

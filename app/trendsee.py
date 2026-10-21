@@ -31,54 +31,64 @@ class TrendseeAuthError(Exception):
     pass
 
 
-async def _login(page) -> bool:
-    """Ищем форму входа и входим логином/паролем из переменных окружения."""
-    login = os.environ.get("TRENDSEE_LOGIN", "")
-    password = os.environ.get("TRENDSEE_PASSWORD", "")
+LOGIN_URL = APP_URL + "/auth/login"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+
+
+async def _login(page) -> None:
+    """Вход по почте и паролю на app.trendsee.io/auth/login. При неудаче — TrendseeAuthError с причиной."""
+    login = os.environ.get("TRENDSEE_LOGIN", "").strip()
+    password = os.environ.get("TRENDSEE_PASSWORD", "").strip()
     if not login or not password:
-        log.error("TRENDSEE_LOGIN / TRENDSEE_PASSWORD не заданы")
-        return False
+        raise TrendseeAuthError("не заданы TRENDSEE_LOGIN / TRENDSEE_PASSWORD")
 
-    pwd = page.locator("input[type=password]")
-    if await pwd.count() == 0:
-        # пробуем открыть страницу входа
-        for path in ("/login", "/auth/login", "/sign-in", "/signin"):
-            try:
-                await page.goto(APP_URL + path, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(2500)
-            except Exception:
-                continue
-            if await page.locator("input[type=password]").count():
-                break
-        pwd = page.locator("input[type=password]")
-        if await pwd.count() == 0:
-            # иногда форма прячется за кнопкой «Войти»
-            for text in ("Войти", "Вход", "Log in", "Login", "Sign in"):
-                btn = page.get_by_text(text, exact=False).first
-                try:
-                    if await btn.count():
-                        await btn.click(timeout=3000)
-                        await page.wait_for_timeout(2000)
-                        if await page.locator("input[type=password]").count():
-                            break
-                except Exception:
-                    pass
-            pwd = page.locator("input[type=password]")
-            if await pwd.count() == 0:
-                log.error("Не нашёл форму входа на Trendsee")
-                return False
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    email = page.locator("input[name=email], input[type=email]").first
+    try:
+        await email.wait_for(state="visible", timeout=30000)
+    except Exception:
+        if "/auth/" not in page.url:
+            return  # уже вошли
+        await _dump(page, "login_noform")
+        raise TrendseeAuthError("не нашёл форму входа на странице Trendsee")
 
-    user_input = page.locator(
-        "input[type=email], input[name*=mail i], input[name*=login i], "
-        "input[name*=user i], input[autocomplete=username], input[type=text]"
-    ).first
-    await user_input.fill(login, timeout=10000)
-    await pwd.first.fill(password, timeout=10000)
-    await pwd.first.press("Enter")
-    await page.wait_for_timeout(6000)
-    ok = await page.locator("input[type=password]").count() == 0
-    log.info("Вход в Trendsee: %s", "успешно" if ok else "не удалось")
-    return ok
+    pwd = page.locator("input[name=password], input[type=password]").first
+    await email.fill(login)
+    await pwd.fill(password)
+    btn = page.get_by_role("button", name="Дальше")
+    if await btn.count():
+        await btn.first.click()
+    else:
+        await pwd.press("Enter")
+    try:
+        await page.wait_for_url(lambda u: "/auth/" not in u, timeout=30000)
+        log.info("Вход в Trendsee: успешно")
+        await page.wait_for_timeout(3000)
+        return
+    except Exception:
+        pass
+    hint = await _dump(page, "login_fail")
+    raise TrendseeAuthError(f"сайт не пустил после ввода почты и пароля{': ' + hint if hint else ''}")
+
+
+async def _dump(page, name: str) -> str:
+    """Сохраняет скриншот и текст страницы в /data для разбора, возвращает подсказку с экрана."""
+    hint = ""
+    try:
+        await page.screenshot(path=str(DATA_DIR / f"{name}.png"), full_page=True)
+        text = await page.locator("body").inner_text(timeout=5000)
+        (DATA_DIR / f"{name}.txt").write_text(f"{page.url}\n\n{text}", encoding="utf-8")
+        skip = ("Вход", "Почта*", "Пароль*", "Забыли пароль?", "Дальше", "Или", "Войти с Telegram",
+                "Войти с Яндекс ID", "Нет аккаунта?", "Регистрация")
+        lines = [l.strip() for l in text.splitlines() if l.strip() and l.strip() not in skip
+                 and "cookie" not in l.lower() and "конфиденциальност" not in l.lower()
+                 and "соглашени" not in l.lower() and "Сервиса" not in l]
+        hint = "; ".join(lines[:3])[:200]
+        log.warning("Страница входа (%s): %s", page.url, hint or "без сообщений")
+    except Exception as ex:
+        log.warning("Не смог сохранить страницу: %s", ex)
+    return hint
 
 
 async def _capture_auth(page, timeout_s: int = 25) -> dict | None:
@@ -135,6 +145,7 @@ async def search(phrases: list[str]) -> list[dict]:
             headless=True,
             args=["--no-sandbox", "--disable-dev-shm-usage"],
             locale="ru-RU",
+            user_agent=UA,
             viewport={"width": 1366, "height": 900},
         )
         try:
@@ -143,9 +154,8 @@ async def search(phrases: list[str]) -> list[dict]:
 
             auth = await _capture_auth(page)
             if not auth:
-                log.info("Нет авторизованных запросов — пробую войти")
-                if not await _login(page):
-                    raise TrendseeAuthError("не удалось войти в Trendsee")
+                log.info("Нет авторизованных запросов — вхожу")
+                await _login(page)
                 auth = await _capture_auth(page)
                 if not auth:
                     raise TrendseeAuthError("после входа нет запросов с authorization")
