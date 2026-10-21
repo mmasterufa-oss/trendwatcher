@@ -44,6 +44,15 @@ def fmt_num(x) -> str:
     return f"{int(x):,}".replace(",", " ")
 
 
+def fmt_short(x) -> str:
+    x = float(x or 0)
+    if x >= 1_000_000:
+        return f"{x / 1_000_000:.1f}".rstrip("0").rstrip(".").replace(".", ",") + " млн"
+    if x >= 1000:
+        return f"{x / 1000:.0f} тыс"
+    return str(int(x))
+
+
 def fmt_viral(x) -> str:
     if x is None:
         return ""
@@ -66,8 +75,21 @@ def render_parts(items: list[dict], header: str, show_niche: bool = True) -> lis
         title = it.get("title") or (it.get("caption") or "").split("\n")[0][:70] or it.get("author") or "Ролик"
         stats = f"👁 {fmt_num(it.get('views'))} · ❤ {fmt_num(it.get('likes'))}{fmt_viral(it.get('viral'))}"
         block = [f"\n<b>{i}. «{e(title)}»</b> · {stats}"]
+        meta = []
+        plat = trendsee.PLATFORMS.get(it.get("platform") or "", "")
+        if plat:
+            meta.append(("🎵 " if plat == "TikTok" else "📸 ") + plat)
         if it.get("author"):
-            block.append(f"Автор: {e(it['author'])} · запрос: {e(it.get('query'))}")
+            meta.append(f"@{e(it['author'])}" + (f" ({fmt_short(it['subscribers'])} подп.)" if it.get("subscribers") else ""))
+        if it.get("date"):
+            try:
+                meta.append(datetime.fromisoformat(it["date"]).astimezone(TZ).strftime("%d.%m.%Y"))
+            except Exception:
+                pass
+        if it.get("query"):
+            meta.append(f"запрос: {e(it['query'])}")
+        if meta:
+            block.append(" · ".join(meta))
         if it.get("why"):
             block.append(f"Почему залетел: {e(it['why'])}")
         if it.get("idea"):
@@ -151,8 +173,14 @@ async def make_batch(pool: list[dict] | None = None) -> tuple[str, list[dict]]:
         if not pool or len(pool) < 3:
             phrases = pick_phrases(kw)
             log.info("Ищу по фразам: %s", phrases)
-            posts = await asyncio.wait_for(trendsee.search(phrases), timeout=600)
+            jobs = [{"query": q} for q in phrases]                                     # самые вирусные
+            jobs += [{"query": q, "order": "taken_at", "max_age_days": 30} for q in phrases[:3]]  # свежие
+            jobs += [{"query": q, "social": "tiktok"} for q in phrases[:2]]            # TikTok отдельно
+            posts = await asyncio.wait_for(trendsee.search(jobs), timeout=900)
             pool = filter_candidates(posts)
+            if len(pool) < 5:
+                pool += [p for p in filter_candidates(posts, days=90)
+                         if p["link"] not in {x["link"] for x in pool}][: 15 - len(pool)]
             log.info("Кандидатов после фильтра: %d", len(pool))
         items = await ai.pick_five(pool, niche)
     shown = {i["link"] for i in items}
@@ -210,11 +238,18 @@ async def send_trends(app: Application, chat_ids: list[int], pool=None, header=N
             log.warning("Не отправил в %s: %s", cid, ex)
 
 
-async def search_query(query: str) -> list[dict]:
+async def search_query(query: str, mode: str) -> list[dict]:
+    if mode == "week":
+        jobs = [{"query": query, "order": "taken_at", "max_age_days": 30, "pages": 5},
+                {"query": query, "order": "taken_at", "max_age_days": 30, "pages": 3, "social": "tiktok"}]
+    else:
+        jobs = [{"query": query},
+                {"query": query, "order": "taken_at", "max_age_days": 30, "pages": 2},
+                {"query": query, "social": "tiktok"}]
     async with search_lock:
         storage.update_state(last_run=datetime.now(TZ).isoformat(timespec="minutes"))
-        log.info("Поиск по запросу пользователя: %s", query)
-        posts = await asyncio.wait_for(trendsee.search([query]), timeout=480)
+        log.info("Поиск по запросу пользователя: %s (%s)", query, mode)
+        posts = await asyncio.wait_for(trendsee.search(jobs), timeout=900)
     storage.update_state(last_ok=datetime.now(TZ).isoformat(timespec="minutes"), last_error=None)
     return posts
 
@@ -222,7 +257,7 @@ async def search_query(query: str) -> list[dict]:
 async def query_trends(app: Application, chat_id: int, query: str, mode: str) -> None:
     """mode='now' — 5 лучших с разбором; mode='week' — все тренды за 7 дней."""
     try:
-        posts = await search_query(query)
+        posts = await search_query(query, mode)
     except trendsee.TrendseeAuthError as ex:
         storage.update_state(last_error=f"доступ к Trendsee: {ex}")
         await app.bot.send_message(chat_id, "⚠️ Не получилось войти в Trendsee. Проверьте логин, пароль и тариф.")
@@ -234,12 +269,16 @@ async def query_trends(app: Application, chat_id: int, query: str, mode: str) ->
         return
 
     if mode == "week":
-        items = filter_candidates(posts, days=7, skip_seen=False, limit=WEEK_LIMIT)
-        if not any(p.get("date") for p in posts):
-            note = "\n<i>Даты публикаций Trendsee не отдал, показываю самые вирусные без отсева по дате.</i>"
-        else:
-            items = [p for p in items if p.get("date")]
-            note = ""
+        dated = [p for p in posts if p.get("date")]
+        items = filter_candidates(dated, days=7, skip_seen=False, limit=WEEK_LIMIT)
+        note = ""
+        if len(items) < 5:
+            extra = [p for p in filter_candidates(dated, days=30, skip_seen=False, limit=WEEK_LIMIT)
+                     if p["link"] not in {i["link"] for i in items}]
+            if extra:
+                note = (f"\n<i>За 7 дней нашлось {len(items)}, добавил самые вирусные за месяц "
+                        f"(с №{len(items) + 1}).</i>")
+                items = items + extra[: WEEK_LIMIT - len(items)]
         if not items:
             await app.bot.send_message(chat_id, f"За последние 7 дней по запросу «{e(query)}» трендов не нашлось.",
                                        reply_markup=menu_kb())
@@ -254,6 +293,9 @@ async def query_trends(app: Application, chat_id: int, query: str, mode: str) ->
         return
 
     pool = filter_candidates(posts, days=30, skip_seen=False, limit=15)
+    if len(pool) < 5:  # свежих мало — добираем самыми вирусными за 3 месяца
+        pool += [p for p in filter_candidates(posts, days=90, skip_seen=False, limit=15)
+                 if p["link"] not in {x["link"] for x in pool}][: 15 - len(pool)]
     if not pool:
         await app.bot.send_message(chat_id, f"По запросу «{e(query)}» свежих трендов не нашлось. "
                                             "Попробуйте сформулировать иначе.", reply_markup=menu_kb())

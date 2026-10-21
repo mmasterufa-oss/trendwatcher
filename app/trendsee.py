@@ -20,9 +20,11 @@ log = logging.getLogger("trendsee")
 
 APP_URL = "https://app.trendsee.io"
 SEARCH_PATH = (
-    "/api/v1/posts/for-you?order_by=viral_coef&anomaly=false&limit=36"
+    "/api/v1/posts/for-you?order_by={order}&anomaly=false&limit=36"
     "&query={q}&search_type=all&personal=true"
 )
+# Площадки, которые сейчас ищет Trendsee: instagram (Reels) и tiktok. Shorts и VK Клипы у них «скоро».
+PLATFORMS = {"instagram": "Reels", "tiktok": "TikTok", "youtube": "Shorts", "vk": "VK Клипы"}
 SKIP_HEADERS = {"host", "content-length", "connection", "accept-encoding", "cookie",
                 "origin", "referer", "user-agent"}
 
@@ -140,7 +142,7 @@ async def _api_get(page, url: str, headers: dict) -> tuple[int, object]:
     return await page.evaluate(
         """async ([url, headers]) => {
             const ctrl = new AbortController();
-            const t = setTimeout(() => ctrl.abort(), 30000);
+            const t = setTimeout(() => ctrl.abort(), 45000);
             try {
               const r = await fetch(url, {headers, credentials: 'include', signal: ctrl.signal});
               const txt = await r.text();
@@ -152,8 +154,18 @@ async def _api_get(page, url: str, headers: dict) -> tuple[int, object]:
     )
 
 
-async def search(phrases: list[str]) -> list[dict]:
-    """Возвращает нормализованные ролики по всем фразам (с полем query)."""
+def _job(j) -> dict:
+    """Задание поиска: query, order (viral_coef|taken_at), social (None|instagram|tiktok),
+    max_age_days (для листания свежих), pages."""
+    if isinstance(j, str):
+        j = {"query": j}
+    return {"query": j["query"], "order": j.get("order", "viral_coef"), "social": j.get("social"),
+            "max_age_days": j.get("max_age_days"), "pages": j.get("pages", 1)}
+
+
+async def search(jobs: list) -> list[dict]:
+    """Выполняет задания поиска, возвращает нормализованные ролики (с полем query)."""
+    jobs = [_job(j) for j in jobs]
     BROWSER_DIR.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
     async with async_playwright() as p:
@@ -179,44 +191,61 @@ async def search(phrases: list[str]) -> list[dict]:
 
             parts = urlsplit(auth["url"])
             base = f"{parts.scheme}://{parts.netloc}"
-            headers = auth["headers"]
-            relogged = False
+            state = {"headers": auth["headers"], "relogged": False}
             sample_saved = (DATA_DIR / "sample_response.json").exists()
 
-            for phrase in phrases:
-                url = base + SEARCH_PATH.format(q=quote(phrase))
-                try:
-                    status, body = await _api_get(page, url, headers)
-                    if status == 401 and not relogged:
-                        relogged = True
-                        log.info("401 — вхожу заново")
-                        await _login(page)
-                        auth = await _capture_auth(page)
-                        if not auth:
-                            raise TrendseeAuthError("вход слетел и не восстановился")
-                        headers = auth["headers"]
-                        status, body = await _api_get(page, url, headers)
-                    if status == 401:
-                        raise TrendseeAuthError("Trendsee отвечает 401")
+            async def fetch(url):
+                status, body = await _api_get(page, url, state["headers"])
+                if status == 401 and not state["relogged"]:
+                    state["relogged"] = True
+                    log.info("401 — вхожу заново")
+                    await _login(page)
+                    a = await _capture_auth(page)
+                    if not a:
+                        raise TrendseeAuthError("вход слетел и не восстановился")
+                    state["headers"] = a["headers"]
+                    status, body = await _api_get(page, url, state["headers"])
+                if status == 401:
+                    raise TrendseeAuthError("Trendsee отвечает 401")
+                return status, body
+
+            for job in jobs:
+                url = base + SEARCH_PATH.format(q=quote(job["query"]), order=job["order"])
+                if job["social"]:
+                    url += f"&social_type={job['social']}"
+                cursor, got = None, 0
+                for page_no in range(max(1, job["pages"])):
+                    try:
+                        status, body = await fetch(url + (f"&cursor={quote(str(cursor))}" if cursor else ""))
+                    except TrendseeAuthError:
+                        raise
+                    except Exception as e:
+                        log.warning("Ошибка запроса «%s»: %s", job["query"], e)
+                        break
                     if status != 200:
-                        log.warning("«%s»: статус %s %s", phrase, status, str(body)[:300])
-                        continue
+                        log.warning("«%s»: статус %s %s", job["query"], status, str(body)[:300])
+                        break
                     if not sample_saved:
                         (DATA_DIR / "sample_response.json").write_text(
                             json.dumps(body, ensure_ascii=False, indent=1)[:200000], encoding="utf-8")
                         sample_saved = True
                     items = parse_posts(body)
-                    log.info("«%s»: %d роликов", phrase, len(items))
-                    if not items:
-                        log.warning("Непонятный формат ответа: %s", json.dumps(body, ensure_ascii=False)[:800])
                     for it in items:
-                        it["query"] = phrase
+                        it["query"] = job["query"]
                     results.extend(items)
-                except TrendseeAuthError:
-                    raise
-                except Exception as e:
-                    log.warning("Ошибка запроса «%s»: %s", phrase, e)
-                await asyncio.sleep(1.0)
+                    got += len(items)
+                    cursor = body.get("next_cursor") if isinstance(body, dict) else None
+                    if not cursor or not items:
+                        break
+                    if job["order"] == "taken_at" and job["max_age_days"]:
+                        oldest = min((it["date"] for it in items if it.get("date")), default=None)
+                        limit = datetime.now(timezone.utc).timestamp() - job["max_age_days"] * 86400
+                        if oldest and datetime.fromisoformat(oldest).timestamp() < limit:
+                            break
+                    await asyncio.sleep(0.5)
+                log.info("«%s» [%s%s]: %d роликов", job["query"], job["order"],
+                         f", {job['social']}" if job["social"] else "", got)
+                await asyncio.sleep(0.5)
         finally:
             await ctx.close()
     return results
@@ -330,7 +359,34 @@ def _post_id(flat) -> str:
 _keys_logged = False
 
 
+def _from_trendsee(raw: dict) -> dict | None:
+    """Формат Trendsee: social_url — ссылка на ролик, blogger_social_url — на автора."""
+    link = raw.get("social_url")
+    if not link:
+        return None
+    author_url = raw.get("blogger_social_url") or ""
+    author = author_url.rstrip("/").rsplit("/", 1)[-1].lstrip("@") if author_url else ""
+    taken = raw.get("taken_at")
+    num = lambda k: float(raw[k]) if isinstance(raw.get(k), (int, float)) else None
+    return {
+        "link": link if "watch?v=" in link else link.split("?")[0],
+        "platform": raw.get("social_type") or "",
+        "author": author,
+        "views": num("play_count"),
+        "likes": num("like_count"),
+        "comments": num("comment_count"),
+        "viral": num("viral_coef"),
+        "subscribers": num("subscribers_count"),
+        "date": taken.replace("Z", "+00:00") if isinstance(taken, str) else None,
+        "caption": (raw.get("caption") or "")[:700],
+    }
+
+
 def parse_posts(body) -> list[dict]:
+    if isinstance(body, dict) and isinstance(body.get("items"), list):
+        exact = [x for x in (_from_trendsee(r) for r in body["items"] if isinstance(r, dict)) if x]
+        if exact:
+            return exact
     lst = _find_list(body) or []
     out = []
     global _keys_logged
