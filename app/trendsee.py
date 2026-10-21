@@ -84,7 +84,17 @@ async def _dump(page, name: str) -> str:
         lines = [l.strip() for l in text.splitlines() if l.strip() and l.strip() not in skip
                  and "cookie" not in l.lower() and "конфиденциальност" not in l.lower()
                  and "соглашени" not in l.lower() and "Сервиса" not in l]
-        hint = "; ".join(lines[:3])[:200]
+        keys = ("невер", "ошиб", "не найден", "не существ", "подтвер", "код", "капч", "робот",
+                "заблок", "попыт", "тариф", "error", "invalid", "wrong")
+        important = [l for l in lines if any(k in l.lower() for k in keys)]
+        # сообщения об ошибке в элементах формы/уведомлениях
+        try:
+            alerts = await page.locator("[role=alert], .error, [class*=error], [class*=toast], "
+                                        "[class*=notif], [class*=invalid]").all_inner_texts()
+            important = [a.strip() for a in alerts if a.strip()] + important
+        except Exception:
+            pass
+        hint = "; ".join(dict.fromkeys(important or lines[-3:]))[:250]
         log.warning("Страница входа (%s): %s", page.url, hint or "без сообщений")
     except Exception as ex:
         log.warning("Не смог сохранить страницу: %s", ex)
