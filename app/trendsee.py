@@ -21,7 +21,7 @@ log = logging.getLogger("trendsee")
 APP_URL = "https://app.trendsee.io"
 SEARCH_PATH = (
     "/api/v1/posts/for-you?order_by={order}&anomaly=false&limit=36"
-    "&query={q}&search_type=all&personal=true"
+    "&query={q}&search_type={stype}&personal=false"
 )
 # Площадки, которые сейчас ищет Trendsee: instagram (Reels) и tiktok. Shorts и VK Клипы у них «скоро».
 PLATFORMS = {"instagram": "Reels", "tiktok": "TikTok", "youtube": "Shorts", "vk": "VK Клипы"}
@@ -160,6 +160,7 @@ def _job(j) -> dict:
     if isinstance(j, str):
         j = {"query": j}
     return {"query": j["query"], "order": j.get("order", "viral_coef"), "social": j.get("social"),
+            "stype": j.get("stype", "description"),
             "max_age_days": j.get("max_age_days"), "pages": j.get("pages", 1)}
 
 
@@ -195,7 +196,11 @@ async def search(jobs: list) -> list[dict]:
             sample_saved = (DATA_DIR / "sample_response.json").exists()
 
             async def fetch(url):
+                await asyncio.sleep(1.2)  # у Trendsee лимит ~1 запрос в секунду
                 status, body = await _api_get(page, url, state["headers"])
+                if status == 429:
+                    await asyncio.sleep(3)
+                    status, body = await _api_get(page, url, state["headers"])
                 if status == 401 and not state["relogged"]:
                     state["relogged"] = True
                     log.info("401 — вхожу заново")
@@ -210,7 +215,7 @@ async def search(jobs: list) -> list[dict]:
                 return status, body
 
             for job in jobs:
-                url = base + SEARCH_PATH.format(q=quote(job["query"]), order=job["order"])
+                url = base + SEARCH_PATH.format(q=quote(job["query"]), order=job["order"], stype=job["stype"])
                 if job["social"]:
                     url += f"&social_type={job['social']}"
                 cursor, got = None, 0
@@ -243,7 +248,7 @@ async def search(jobs: list) -> list[dict]:
                         if oldest and datetime.fromisoformat(oldest).timestamp() < limit:
                             break
                     await asyncio.sleep(0.5)
-                log.info("«%s» [%s%s]: %d роликов", job["query"], job["order"],
+                log.info("«%s» [%s, %s%s]: %d роликов", job["query"], job["stype"], job["order"],
                          f", {job['social']}" if job["social"] else "", got)
                 await asyncio.sleep(0.5)
         finally:
@@ -379,7 +384,20 @@ def _from_trendsee(raw: dict) -> dict | None:
         "subscribers": num("subscribers_count"),
         "date": taken.replace("Z", "+00:00") if isinstance(taken, str) else None,
         "caption": (raw.get("caption") or "")[:700],
+        "speech": _text(raw.get("transcription"))[:1500] or _text(raw.get("subtitles"))[:1500],
     }
+
+
+def _text(v) -> str:
+    if not v:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict):
+        return " ".join(_text(x) for x in v.values())
+    if isinstance(v, list):
+        return " ".join(_text(x) for x in v)
+    return ""
 
 
 def parse_posts(body) -> list[dict]:

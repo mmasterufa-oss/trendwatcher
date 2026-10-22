@@ -38,8 +38,10 @@ def save(name: str, data) -> None:
 # ---------- ключевые слова ----------
 def get_keywords() -> dict:
     kw = load("keywords.json", None)
-    if not kw:
-        kw = json.loads((ROOT / "keywords.default.json").read_text(encoding="utf-8"))
+    default = json.loads((ROOT / "keywords.default.json").read_text(encoding="utf-8"))
+    # новая версия стартовых слов заменяет старую, если владелец её не менял
+    if not kw or (kw.get("version", 1) < default.get("version", 1) and not kw.get("custom")):
+        kw = default
         save("keywords.json", kw)
     return kw
 
@@ -47,6 +49,7 @@ def get_keywords() -> dict:
 def set_keywords(group: str, words: list[str]) -> dict:
     kw = get_keywords()
     kw[group] = words
+    kw["custom"] = True
     save("keywords.json", kw)
     return kw
 

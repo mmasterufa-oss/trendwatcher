@@ -14,7 +14,7 @@ from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, Defaults, MessageHandler, filters)
 
-from . import ai, storage, trendsee
+from . import ai, relevance, storage, trendsee
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -153,13 +153,15 @@ def filter_candidates(posts: list[dict], days: int = 30, skip_seen: bool = True,
                     continue
             except Exception:
                 pass
+        if not relevance.is_relevant(p):
+            continue  # в ролике нет мебели — не наша тема
         uniq[link] = p
 
     def score(p):
-        q = (p.get("query") or "").lower().split()
-        cap = (p.get("caption") or "").lower()
-        match = all(w in cap for w in q) if q else False
-        return (match, p.get("viral") or 0, p.get("views") or 0)
+        q = [w[:5] for w in (p.get("query") or "").lower().split() if len(w) > 2]
+        text = f"{p.get('caption') or ''} {p.get('speech') or ''}".lower()
+        match = all(w in text for w in q) if q else False
+        return (match, min(relevance.score(p), 3), p.get("viral") or 0, p.get("views") or 0)
 
     return sorted(uniq.values(), key=score, reverse=True)[:limit]
 
@@ -174,7 +176,8 @@ async def make_batch(pool: list[dict] | None = None) -> tuple[str, list[dict]]:
             phrases = pick_phrases(kw)
             log.info("Ищу по фразам: %s", phrases)
             jobs = [{"query": q} for q in phrases]                                     # самые вирусные
-            jobs += [{"query": q, "order": "taken_at", "max_age_days": 30} for q in phrases[:3]]  # свежие
+            jobs += [{"query": q, "order": "taken_at", "max_age_days": 30, "pages": 2}
+                     for q in phrases[:3]]                                              # свежие
             jobs += [{"query": q, "social": "tiktok"} for q in phrases[:2]]            # TikTok отдельно
             posts = await asyncio.wait_for(trendsee.search(jobs), timeout=900)
             pool = filter_candidates(posts)
@@ -239,13 +242,16 @@ async def send_trends(app: Application, chat_ids: list[int], pool=None, header=N
 
 
 async def search_query(query: str, mode: str) -> list[dict]:
+    # «по описанию» — точные совпадения; «по всему» — добор для длинных фраз (потом фильтр по мебели)
     if mode == "week":
         jobs = [{"query": query, "order": "taken_at", "max_age_days": 30, "pages": 5},
-                {"query": query, "order": "taken_at", "max_age_days": 30, "pages": 3, "social": "tiktok"}]
+                {"query": query, "order": "taken_at", "max_age_days": 30, "pages": 2, "social": "tiktok"},
+                {"query": query, "order": "taken_at", "max_age_days": 30, "pages": 3, "stype": "all"}]
     else:
         jobs = [{"query": query},
                 {"query": query, "order": "taken_at", "max_age_days": 30, "pages": 2},
-                {"query": query, "social": "tiktok"}]
+                {"query": query, "social": "tiktok"},
+                {"query": query, "stype": "all", "pages": 2}]
     async with search_lock:
         storage.update_state(last_run=datetime.now(TZ).isoformat(timespec="minutes"))
         log.info("Поиск по запросу пользователя: %s (%s)", query, mode)
@@ -297,8 +303,9 @@ async def query_trends(app: Application, chat_id: int, query: str, mode: str) ->
         pool += [p for p in filter_candidates(posts, days=90, skip_seen=False, limit=15)
                  if p["link"] not in {x["link"] for x in pool}][: 15 - len(pool)]
     if not pool:
-        await app.bot.send_message(chat_id, f"По запросу «{e(query)}» свежих трендов не нашлось. "
-                                            "Попробуйте сформулировать иначе.", reply_markup=menu_kb())
+        await app.bot.send_message(chat_id, f"По запросу «{e(query)}» роликов с мебелью не нашлось. "
+                                            "Попробуйте короче, одним-двумя словами: «стол», «диван», «сборка».",
+                                   reply_markup=menu_kb())
         return
     async with search_lock:
         items = await ai.pick_five(pool, storage.get_keywords().get("niche", ""))
@@ -515,7 +522,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         ctx.chat_data["await"] = "now" if text == BTN_QUERY_NOW else "week"
         what = "5 лучших трендов" if text == BTN_QUERY_NOW else "все тренды за последние 7 дней"
         await update.message.reply_text(
-            f"Напишите запрос — пришлю {what}.\nНапример: <i>шкаф купе</i>, <i>кухня в хрущёвке</i>, <i>home decor</i>",
+            f"Напишите запрос — пришлю {what}.\nЛучше 1-2 слова: <i>диван</i>, <i>стол</i>, <i>сборка мебели</i>, "
+            "<i>было стало</i>, <i>sofa</i>",
             reply_markup=ForceReply(selective=True, input_field_placeholder="ваш запрос"))
         return
     mode = ctx.chat_data.pop("await", None)
